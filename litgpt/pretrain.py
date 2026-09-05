@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from torchmetrics.aggregation import RunningMean
 
 from litgpt import Tokenizer
-from litgpt.args import EvalArgs, LogArgs, TrainArgs
+from litgpt.args import EvalArgs, KresArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
@@ -66,6 +66,7 @@ def setup(
     ),
     eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
     log: LogArgs = LogArgs(),
+    kres: KresArgs = KresArgs(),
     optimizer: str | dict = "AdamW",
     devices: int | str = "auto",
     num_nodes: int = 1,
@@ -169,6 +170,7 @@ def setup(
         tokenizer=tokenizer,
         train=train,
         eval=eval,
+        kres=kres,
         optimizer=optimizer,
     )
 
@@ -188,6 +190,7 @@ def main(
     eval: EvalArgs,
     optimizer: str | dict,
     num_nodes: int = 1,
+    kres: KresArgs = KresArgs(),
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -236,6 +239,10 @@ def main(
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
 
+    # W₀ 必须在权重就位之后才取，而"权重就位"有两条路：首段是上面的 load_raw，
+    # 续跑是 fabric.load(resume, state)。放在这里两条路都已经走完。
+    regularizer = build_regularizer(fabric, model, config, kres, initial_checkpoint_dir, bool(resume))
+
     train_time = time.perf_counter()
 
     # work around PyTorch issue https://github.com/pytorch/pytorch/issues/152162
@@ -261,6 +268,8 @@ def main(
         tokenizer_dir=tokenizer_dir,
         train=train,
         eval=eval,
+        kres=kres,
+        regularizer=regularizer,
     )
 
     # Save final checkpoint
@@ -284,6 +293,103 @@ def main(
     fabric.print(separator)
 
 
+def build_regularizer(
+    fabric: L.Fabric,
+    model: nn.Module,
+    config: Config,
+    kres: KresArgs,
+    initial_checkpoint_dir: Path | None,
+    resuming: bool,
+):
+    """构造 OneReplay 协方差正则器，或在未启用时返回 None。
+
+    这里是三个静默失效风险中两个的落点，所以每一步都硬失败、不给"降级继续"的路：
+
+    1. **调用时机。** 必须在权重就位之后。首段靠 `load_raw`（上面 L223），续跑靠
+       `fabric.load(resume, state)`，两者互斥，所以本函数只能在两条路都走完之后调。
+       首段会拿 `lit_model.pth` 逐比特验证快照，这同时证明了模型确实收到了基座权重。
+
+    2. **目标层清单不从 C 文件推。** 从模型的模块树上独立点出来，再用 `assert_covers`
+       和 C 的键集双向比对。如果反过来拿 C 的键当清单，`assert_covers` 就变成自证，
+       C 少了几层这件事永远查不出来——而那正是"惩罚静默变小、λ 悄悄换了含义"的入口。
+
+    3. **续跑的 W₀ 来源。** 见 `KresArgs.base_checkpoint`：续跑段的模型权重已经漂移，
+       W₀ 只能从基座文件读。
+    """
+    if not kres.enabled:
+        return None
+
+    from kres.covariance import module_in_features, target_names_from_linears
+    from kres.regularizer import ReplayRegularizer, canonical_name
+
+    if kres.base_checkpoint:
+        base_checkpoint = Path(kres.base_checkpoint)
+    elif initial_checkpoint_dir is not None:
+        base_checkpoint = initial_checkpoint_dir / "lit_model.pth"
+    else:
+        raise ValueError(
+            "启用了 `--kres.cov_path` 但没有 W₀ 的来源。续跑时 `--initial_checkpoint_dir` "
+            "不可用（与 `--resume` 互斥），必须显式给 `--kres.base_checkpoint`，"
+            "否则 W₀ 会变成当前漂移过的权重、惩罚方向随之改变"
+        )
+
+    linear_names = [canonical_name(n) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    target_names = target_names_from_linears(linear_names, config.n_layer, kres.include_lm_head)
+
+    regularizer = ReplayRegularizer.from_path(
+        kres.cov_path,
+        model=model,
+        target_names=target_names,
+        checkpoint_path=base_checkpoint,
+        device=fabric.device,
+        identity=kres.identity,
+        dtype=getattr(torch, kres.cov_dtype),
+        resuming=resuming,
+        module_shapes=module_in_features(model, target_names),
+        reg_impl=kres.reg_impl,
+        log_grad_norms=kres.log_grad_norms,
+    )
+
+    fabric.print(
+        f"kres: λ={kres.replay_lambda} 目标层={len(target_names)} "
+        f"identity={int(kres.identity)} lm_head={int(kres.include_lm_head)} "
+        f"注入点={'clip 之前' if kres.inject_before_clip else 'clip 之后'} "
+        f"W₀来源={'基座文件（续跑）' if resuming else '模型快照（已逐比特验证）'}"
+    )
+    fabric.print(
+        f"kres: C {regularizer.memory_bytes() / 1e9:.2f} GB + "
+        f"W₀ {regularizer.reference_memory_bytes() / 1e9:.2f} GB 常驻（成本表用这两个数）"
+    )
+    return regularizer
+
+
+def apply_penalty(fabric: L.Fabric, regularizer, model: nn.Module, kres: KresArgs) -> tuple[float, dict]:
+    """把 λ·dR/dW 累加进 .grad，返回 (归一化后的 R, 统计量)。
+
+    两条实现算的是同一个惩罚，都**每个 optimizer step 只调一次**：
+
+    - analytic 直接写 `.grad`，是正式路径。
+    - autograd 对 λ·R 调 backward，梯度同样累加进 `.grad`。它只为等价性校验存在，
+      所以这里不去拆出惩罚自己的范数（要拆得先把 `.grad` 存一份，那是 1.41 GB 的
+      临时开销，不值得为一条校验路径付）。`reg_grad_norm` 因此报 nan。
+    """
+    if regularizer.injects_grad:
+        return regularizer.accumulate_grad(model, kres.replay_lambda)
+
+    from kres.regularizer import global_grad_norm
+
+    lm_norm = global_grad_norm(model) if kres.log_grad_norms else float("nan")
+    penalty = regularizer.penalty(model)
+    fabric.backward(penalty * kres.replay_lambda)
+    stats = {
+        "used_layers": float(len(regularizer.layers(model))),
+        "lm_grad_norm": lm_norm,
+        "reg_grad_norm": float("nan"),
+        "total_grad_norm": global_grad_norm(model) if kres.log_grad_norms else float("nan"),
+    }
+    return float(penalty), stats
+
+
 def fit(
     fabric: L.Fabric,
     devices: int,
@@ -295,6 +401,8 @@ def fit(
     train: TrainArgs,
     eval: EvalArgs,
     num_nodes: int = 1,
+    kres: KresArgs = KresArgs(),
+    regularizer=None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -328,8 +436,23 @@ def fit(
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
         fabric.device
     )
+    # 最近一个 optimizer step 的惩罚量 + 裁剪触发计数。裁剪触发率是判断
+    # `inject_before_clip` 到底有没有实际影响的唯一依据：它一直是 0 的话，
+    # 注入点选哪边完全等价；接近 1 的话，λ 的隐式缩放就是逐步在发生的
+    reg_running = {"R": 0.0, "clip_hits": 0, "clip_steps": 0}
+
+    # 计时器与 kres 正则无关地建起来：成本表要对比三条臂，baseline 臂也得有同一套口径的
+    # 数，否则"贵多少"就没有分母。只受 --kres.profile 控制
+    from kres.profiling import PhaseTimer, cost_record, format_cost_summary, reset_peak_memory
+
+    timer = PhaseTimer(fabric.device, enabled=kres.profile, warmup_steps=kres.profile_warmup_steps)
+    peaks_reset = False
+    # steady 段的起点：时间与 step 数必须成对推进，否则 sec_per_step 的分子分母口径不一致
+    steady_step0 = 0
+
     fabric.barrier()
     total_t0 = time.perf_counter()
+    steady_t0 = total_t0
 
     warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
 
@@ -349,7 +472,7 @@ def fit(
         targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
+        with timer.track("fwd_bwd"), fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
             loss = chunked_cross_entropy(logits, targets)
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
@@ -357,10 +480,43 @@ def fit(
         running_loss.update(loss.detach())
 
         if not is_accumulating:
-            fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
-            optimizer.step()
-            optimizer.zero_grad()
+            # 惩罚每个 optimizer step 只注入一次。R 只依赖 W 和 C，而 W 在一个梯度
+            # 累积窗口内不变（optimizer.step 只在窗口末尾执行），所以窗口内它是常量。
+            # 放进上面的 micro-batch 循环就是 gradient_accumulation_iters 倍的 λ
+            # （本项目约 125，取决于 global_batch_size），而这个错误不报任何异常。
+            if regularizer is not None and kres.inject_before_clip:
+                with timer.track("penalty"):
+                    reg_value, reg_stats = apply_penalty(fabric, regularizer, model, kres)
+
+            with timer.track("clip"):
+                fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
+
+            if regularizer is not None and not kres.inject_before_clip:
+                with timer.track("penalty"):
+                    reg_value, reg_stats = apply_penalty(fabric, regularizer, model, kres)
+
+            if regularizer is not None:
+                reg_running["R"] = reg_value
+                reg_running.update(reg_stats)
+                # 裁剪的触发率：只有它大于 0，注入点选哪边才有实际差别。
+                # 注意口径要用注入后的总范数，因为那才是 clip_gradients 看到的量
+                if train.max_norm and reg_stats["total_grad_norm"] > train.max_norm:
+                    reg_running["clip_hits"] += 1
+                reg_running["clip_steps"] += 1
+
+            with timer.track("optimizer"):
+                optimizer.step()
+                optimizer.zero_grad()
             state["step_count"] += 1
+            timer.mark_step()
+
+            # warmup 一过就重开显存窗口。编译期的临时峰值可能比 steady state 还高，
+            # 不重置的话成本表报的是编译峰值，而那个数与训练本身无关
+            if not peaks_reset and not timer.in_warmup:
+                reset_peak_memory([fabric.device])
+                steady_t0 = time.perf_counter()
+                steady_step0 = state["step_count"]
+                peaks_reset = True
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
@@ -385,6 +541,18 @@ def fit(
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
             }
+            if regularizer is not None:
+                metrics.update(
+                    {
+                        "reg_R": reg_running["R"],
+                        "reg_lambda": kres.replay_lambda,
+                        "reg_used_layers": reg_running.get("used_layers", 0.0),
+                        "reg_grad_norm": reg_running.get("reg_grad_norm", float("nan")),
+                        "lm_grad_norm": reg_running.get("lm_grad_norm", float("nan")),
+                        "total_grad_norm": reg_running.get("total_grad_norm", float("nan")),
+                        "clip_rate": reg_running["clip_hits"] / max(reg_running["clip_steps"], 1),
+                    }
+                )
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
@@ -394,6 +562,14 @@ def fit(
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
                 f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
+                + (
+                    f" | R: {metrics['reg_R']:.3e}"
+                    f" |g_lm|: {metrics['lm_grad_norm']:.3f}"
+                    f" |g_reg|: {metrics['reg_grad_norm']:.3e}"
+                    f" clip: {metrics['clip_rate']:.0%}"
+                    if regularizer is not None
+                    else ""
+                )
             )
 
             throughput_metrics = throughput.compute()
@@ -413,6 +589,30 @@ def fit(
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
             save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+
+    # 成本汇总。分母用 steady_t0 而不是 total_t0，也就是 warmup 之后那一段——per-step
+    # 时间要跨臂比较，掺进编译时间就不可比了。只在 rank 0 打印，否则多卡会刷 world_size 份
+    # step 数从 steady 段起点算起，和 steady_t0 配对。跑得比 warmup 还短时 steady_step0
+    # 仍是 0，此时报的就是含 warmup 的全程——短 run 本来就没有 steady state 可言
+    steady_steps = max(state["step_count"] - steady_step0, 0)
+    record = cost_record(
+        [fabric.device],
+        grad_accum=train.gradient_accumulation_iters(devices, num_nodes),
+        train_sec=time.perf_counter() - steady_t0,
+        steps=steady_steps,
+        tokens=steady_steps
+        * train.gradient_accumulation_iters(devices, num_nodes)
+        * train.micro_batch_size
+        * model.max_seq_length
+        * fabric.world_size,
+        timer=timer,
+        covariance_bytes=regularizer.memory_bytes() if regularizer is not None else 0,
+        reference_bytes=regularizer.reference_memory_bytes() if regularizer is not None else 0,
+        extra={"reg_lambda": kres.replay_lambda, "reg_enabled": float(regularizer is not None)},
+    )
+    if fabric.global_rank == 0:
+        fabric.print(format_cost_summary(record))
+    fabric.log_dict({k: v for k, v in record.items() if isinstance(v, (int, float))}, step=state["iter_num"])
 
     # Final validation
     if eval.final_validation:

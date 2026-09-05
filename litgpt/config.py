@@ -3191,4 +3191,46 @@ r1_distill_llama = [
 
 configs.extend(r1_distill_llama)
 
+
+################
+# Open-sci-ref
+################
+# A Llama variant from LAION/open-sci (arXiv:2509.09009): biases on every linear
+# layer (QKV, attention output, FFN) and QK-RMSNorm applied per head before RoPE.
+#
+# `rope_base=100000` follows the paper, which pairs 4096 context with RoPE base 100k.
+# The v0.01 checkpoints ship a config.json claiming 10000, which contradicts it; the
+# v0.02 re-training (also dropping the 0.1 attention dropout of v0.01) is consistent.
+#
+# Embeddings are tied. Config has no field for that -- pass `--train.tie_embeddings=true`
+# when training, otherwise wte and lm_head drift apart and the topology stops matching
+# the base checkpoint.
+open_sci_ref = [
+    # https://huggingface.co/open-sci/open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096
+    dict(
+        name="open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096",
+        hf_config=dict(org="open-sci", name="open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096"),
+        block_size=4096,
+        vocab_size=50304,
+        padded_vocab_size=50304,
+        n_layer=22,
+        n_embd=1024,
+        n_head=16,
+        n_query_groups=16,
+        head_size=64,
+        rotary_percentage=1.0,
+        rope_base=100000,
+        parallel_residual=False,
+        norm_class_name="RMSNorm",
+        norm_eps=1e-5,
+        norm_qk=True,
+        norm_qk_type="default",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=3840,
+        bias=True,
+        lm_head_bias=False,
+    ),
+]
+configs.extend(open_sci_ref)
+
 name_to_config = {config["name"]: config for config in configs}

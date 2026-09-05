@@ -153,7 +153,18 @@ def copy_weights_hf_llama(
         "model.layers.{}.self_attn.q_proj.weight": None,
         "model.layers.{}.self_attn.k_proj.weight": None,
         "model.layers.{}.self_attn.v_proj.weight": None,
+        # variants with biased attention projections, e.g. open-sci-ref. The q/k/v biases
+        # are mapped to None because they get fused into `attn.qkv.bias` further down,
+        # the same way the q/k/v weights are fused into `attn.qkv.weight`.
+        "model.layers.{}.self_attn.q_proj.bias": None,
+        "model.layers.{}.self_attn.k_proj.bias": None,
+        "model.layers.{}.self_attn.v_proj.bias": None,
         "model.layers.{}.self_attn.o_proj.weight": "transformer.h.{}.attn.proj.weight",
+        "model.layers.{}.self_attn.o_proj.bias": "transformer.h.{}.attn.proj.bias",
+        # QK-norm under the `q_layernorm`/`k_layernorm` names used by open-sci-ref
+        # (Qwen3 and OLMo2 spell the same thing `q_norm`/`k_norm`)
+        "model.layers.{}.self_attn.q_layernorm.weight": "transformer.h.{}.attn.norm_q.weight",
+        "model.layers.{}.self_attn.k_layernorm.weight": "transformer.h.{}.attn.norm_k.weight",
         "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
         "model.layers.{}.post_attention_layernorm.weight": "transformer.h.{}.norm_2.weight",
         "model.layers.{}.post_attention_layernorm.bias": "transformer.h.{}.norm_2.bias",
@@ -176,6 +187,10 @@ def copy_weights_hf_llama(
                 "model.layers.{}.mlp.gate_proj.weight": "transformer.h.{}.mlp.fc_1.weight",
                 "model.layers.{}.mlp.up_proj.weight": "transformer.h.{}.mlp.fc_2.weight",
                 "model.layers.{}.mlp.down_proj.weight": "transformer.h.{}.mlp.proj.weight",
+                # variants with a biased FFN, e.g. open-sci-ref
+                "model.layers.{}.mlp.gate_proj.bias": "transformer.h.{}.mlp.fc_1.bias",
+                "model.layers.{}.mlp.up_proj.bias": "transformer.h.{}.mlp.fc_2.bias",
+                "model.layers.{}.mlp.down_proj.bias": "transformer.h.{}.mlp.proj.bias",
             }
         )
     else:
