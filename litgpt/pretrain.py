@@ -221,6 +221,19 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
+
+    # 混合 dataloader 的交错比例是 replay/(new+replay)，只有总量恰好等于 plan 算的
+    # train_max_tokens 时，跑完全程消耗的 replay 才恰好是一个 epoch。填小了 replay 段
+    # 跑不满（尾巴那批文档只进了 C、没被重放），填大了 replay 中途耗尽。两种都不会自己
+    # 暴露出来，所以在这里就硬失败。
+    expected = getattr(data, "expected_max_tokens", None)
+    if expected is not None and train.max_tokens != expected:
+        raise SystemExit(
+            f"--train.max_tokens={train.max_tokens} 与 replay_plan.json 里这条臂的 "
+            f"train_max_tokens={expected} 不符。这个值必须照抄 plan：它等于「新域预算 + 该臂的 "
+            f"replay 量」，直接填 8B 会让各臂的新域预算不相等。"
+        )
+
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     if initial_checkpoint_dir:
@@ -455,13 +468,44 @@ def fit(
     steady_t0 = total_t0
 
     warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+    # cooldown 锚在本臂自己的 max_iters 上，而 max_iters 来自本臂的 --train.max_tokens。
+    # 各臂总步数不同（新域 8B 之外还要过各自的 replay），这样每条臂都完整走一遍
+    # warmup→stable→cooldown，终点都是退火完成的状态
+    cooldown_iters = int(max_iters * train.lr_cooldown_fraction) if train.lr_schedule == "wsd" else 0
+    ga = train.gradient_accumulation_iters(devices, num_nodes)
+    # 这个检查不能只在 rank 0 上做：只有一个 rank 退出会把其余 rank 挂在下一次 barrier 上
+    if warmup_iters + cooldown_iters > max_iters:
+        raise SystemExit(
+            f"warmup({warmup_iters // ga}) + cooldown({cooldown_iters // ga}) 超过总步数 "
+            f"{max_iters // ga}，没有 stable 段。调小 --train.lr_warmup_steps 或 "
+            f"--train.lr_cooldown_fraction。"
+        )
+    fabric.print(
+        f"LR：{train.lr_schedule} peak={optimizer.defaults['lr']:.2e} min={train.min_lr:.2e}，"
+        f"共 {max_iters // ga} 个 optimizer step（"
+        + (
+            f"warmup {warmup_iters // ga} + stable {(max_iters - warmup_iters - cooldown_iters) // ga}"
+            f" + cooldown {cooldown_iters // ga}"
+            if train.lr_schedule == "wsd"
+            else f"warmup {warmup_iters // ga} + cosine {(max_iters - warmup_iters) // ga}"
+        )
+        + "）"
+    )
 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
 
         # determine and set the learning rate for this iteration
-        lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
+        lr = get_lr(
+            optimizer.defaults["lr"],
+            state["iter_num"],
+            warmup_iters,
+            max_iters,
+            train.min_lr,
+            schedule=train.lr_schedule,
+            cooldown_iters=cooldown_iters,
+        )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -614,6 +658,14 @@ def fit(
         fabric.print(format_cost_summary(record))
     fabric.log_dict({k: v for k, v in record.items() if isinstance(v, (int, float))}, step=state["iter_num"])
 
+    # 混合 dataloader 的收尾对账：新域和 replay 各真的喂了多少。replay 没跑满一个 epoch
+    # 的话，没被重放的那批文档仍然进了 C，「replay 与 C 同源」对它们就不成立了——这件事
+    # 除了在这里报，没有别的地方看得出来
+    # 取 _dataloader：_FabricDataLoader 只 update 了实例字典，方法是类上的，不转发
+    summary = getattr(getattr(train_dataloader, "_dataloader", train_dataloader), "consumption_summary", None)
+    if summary is not None:
+        fabric.print(summary())
+
     # Final validation
     if eval.final_validation:
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
@@ -659,15 +711,45 @@ def get_dataloaders(
     return train_dataloader, val_dataloader
 
 
-# learning rate decay scheduler (cosine with linear warmup)
-def get_lr(learning_rate: float, it: int, warmup_iters: int, max_iters: int, min_lr: float) -> float:
-    # 1) linear warmup for warmup_iters steps
+def get_lr(
+    learning_rate: float,
+    it: int,
+    warmup_iters: int,
+    max_iters: int,
+    min_lr: float,
+    schedule: str = "cosine",
+    cooldown_iters: int = 0,
+) -> float:
+    """两种 schedule：cosine（litgpt 原逻辑）与 wsd（warmup-stable-decay）。
+
+    `it` 与 `max_iters` 都以 micro-batch 计（调用点传的是 `state["iter_num"]`），不是
+    optimizer step。两者同口径，所以形状是对的，但读日志时别把 warmup_iters 当成步数。
+
+    **wsd 的 cooldown 锚在本臂自己的 max_iters 上**，而 max_iters 由本臂的
+    `--train.max_tokens` 推出。三条 replay 臂总步数不同（新域 8B 之外还要过 1/4/8B 的
+    replay），这样每条臂都完整走一遍 warmup→stable→cooldown，终点都是退火完成的状态，
+    臂间才可比。若改成共用一条绝对曲线，短的那条臂会在 stable 段中途被切断，它的终点
+    模型是「还热着」的，与退火完的臂比 loss 等于在比两种不同的东西。
+    """
+    # 1) 线性 warmup
     if it < warmup_iters:
         return learning_rate * it / warmup_iters
-    # 2) if it > max_iters, return min learning rate
     if it > max_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+
+    if schedule == "wsd":
+        if cooldown_iters <= 0:
+            return learning_rate
+        # 2) stable：cooldown 开始之前一直保持 peak
+        decay_start = max_iters - cooldown_iters
+        if it < decay_start:
+            return learning_rate
+        # 3) 线性 cooldown。+1 是为了让最后一个 iter 正好落在 min_lr 上——退火的终点值
+        #    直接决定终态模型，差一格就不是「退火完成」了
+        ratio = min((it - decay_start + 1) / cooldown_iters, 1.0)
+        return learning_rate - ratio * (learning_rate - min_lr)
+
+    # cosine（litgpt 原逻辑）
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
@@ -715,11 +797,14 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         for name in names:
             if getattr(args, name) is not None:
                 issues.append(f"{__file__} doesn't support the {name!r} argument. This is set in {args}")
+    # 这份 fit() 的循环只看 `iter_num >= max_iters`（由 max_tokens 推出），max_steps
+    # 一次都没被读过。原来只发一句「建议用于 profiling/debug」的警告，等于承诺它有效——
+    # 拿它跑 50 步冒烟的人会得到一个跑满 3814 步的作业，而警告已经在几千行日志之前滚走了。
+    # 要限制步数就把 max_tokens 设成 步数 × global_batch_size × seq_len。
     if train.max_steps is not None:
-        warnings.warn(
-            "`train.max_steps` is intended for profiling or debug runs only. "
-            "For full pretraining runs, prefer `train.max_tokens` or `train.max_time`.",
-            UserWarning,
+        issues.append(
+            "`--train.max_steps` 在这份 pretrain.py 里不生效（循环只看由 max_tokens 推出的 "
+            "max_iters）。要跑短 run，请设 --train.max_tokens = 步数 × global_batch_size × seq_len。"
         )
     required = [(train, ["max_tokens", "max_norm"])]
     for args, names in required:

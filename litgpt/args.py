@@ -20,6 +20,10 @@ class TrainArgs:
     """Number of iterations with learning rate warmup active"""
     lr_warmup_fraction: float | None = None
     """The fraction of an epoch to use for learning rate warmup"""
+    lr_schedule: str = "cosine"
+    """`cosine`（litgpt 原行为）或 `wsd`（warmup-stable-decay，基座 open-sci-ref 用的那种）"""
+    lr_cooldown_fraction: float = 0.2
+    """wsd 的 cooldown 占总步数的比例，锚在本臂自己的总步数上（各臂各跑完整一个周期）"""
     epochs: int | None = None
     """Number of epochs to train on"""
     # TODO: `pretrain` is the only script using `max_tokens` explicitly. replace it with epoch_size*epochs?
@@ -45,6 +49,13 @@ class TrainArgs:
             )
         if self.lr_warmup_fraction and not (0 <= self.lr_warmup_fraction <= 1):
             raise ValueError("`--train.lr_warmup_fraction` must be between 0 and 1.")
+
+        if self.lr_schedule not in ("cosine", "wsd"):
+            raise ValueError(f"`--train.lr_schedule` 只能是 cosine 或 wsd，收到 {self.lr_schedule!r}")
+        if not (0 < self.lr_cooldown_fraction <= 1):
+            raise ValueError(
+                f"`--train.lr_cooldown_fraction` 必须在 (0, 1]，收到 {self.lr_cooldown_fraction}"
+            )
 
         if self.lr_warmup_steps and self.max_steps and (self.lr_warmup_steps >= self.max_steps):
             warnings.warn(
