@@ -451,12 +451,17 @@ def fit(
     )
     # 最近一个 optimizer step 的惩罚量 + 裁剪触发计数。裁剪触发率是判断
     # `inject_before_clip` 到底有没有实际影响的唯一依据：它一直是 0 的话，
-    # 注入点选哪边完全等价；接近 1 的话，λ 的隐式缩放就是逐步在发生的
-    reg_running = {"R": 0.0, "clip_hits": 0, "clip_steps": 0}
+    # 注入点选哪边完全等价；接近 1 的话，λ 的隐式缩放就是逐步在发生的。
+    # 基线臂（没有正则器）也要记这两个数，否则正则臂那个触发率没有分母：loss spike
+    # 本来就会把范数顶过 max_norm，不减掉基线就没法把触发归因到惩罚头上。
+    # window_* 是上一个 log 区间内的计数，累计率会把 warmup 的暂态一直摊进后面，
+    # 分不清裁剪是开头几步的事还是全程都在发生。
+    reg_running = {"R": 0.0, "clip_hits": 0, "clip_steps": 0, "window_hits": 0, "window_steps": 0}
 
     # 计时器与 kres 正则无关地建起来：成本表要对比三条臂，baseline 臂也得有同一套口径的
     # 数，否则"贵多少"就没有分母。只受 --kres.profile 控制
     from kres.profiling import PhaseTimer, cost_record, format_cost_summary, reset_peak_memory
+    from kres.regularizer import global_grad_norm
 
     timer = PhaseTimer(fabric.device, enabled=kres.profile, warmup_steps=kres.profile_warmup_steps)
     peaks_reset = False
@@ -538,6 +543,22 @@ def fit(
                 with timer.track("penalty"):
                     reg_value, reg_stats = apply_penalty(fabric, regularizer, model, kres)
 
+            # 测点必须在 clip 之前，而且要用 clip_gradients 实际看到的那个范数：
+            # inject_before_clip 时那是注入之后的总范数，apply_penalty 刚算过，别再算一遍；
+            # 其余三种情形（基线臂、或先裁后注入）clip 看到的都是纯 LM 梯度的范数
+            if kres.log_grad_norms and train.max_norm:
+                injected = regularizer is not None and kres.inject_before_clip
+                pre_clip_norm = reg_stats["total_grad_norm"] if injected else global_grad_norm(model)
+                if regularizer is None:
+                    # 有正则器时这个字段归 apply_penalty 的 reg_stats 管，下面的 update 会覆盖，
+                    # 别在这里跟它抢；基线臂没人写，只能在这里填
+                    reg_running["lm_grad_norm"] = pre_clip_norm
+                if pre_clip_norm > train.max_norm:
+                    reg_running["clip_hits"] += 1
+                    reg_running["window_hits"] += 1
+                reg_running["clip_steps"] += 1
+                reg_running["window_steps"] += 1
+
             with timer.track("clip"):
                 fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
 
@@ -548,11 +569,6 @@ def fit(
             if regularizer is not None:
                 reg_running["R"] = reg_value
                 reg_running.update(reg_stats)
-                # 裁剪的触发率：只有它大于 0，注入点选哪边才有实际差别。
-                # 注意口径要用注入后的总范数，因为那才是 clip_gradients 看到的量
-                if train.max_norm and reg_stats["total_grad_norm"] > train.max_norm:
-                    reg_running["clip_hits"] += 1
-                reg_running["clip_steps"] += 1
 
             with timer.track("optimizer"):
                 optimizer.step()
@@ -591,6 +607,15 @@ def fit(
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
             }
+            if kres.log_grad_norms and train.max_norm:
+                metrics.update(
+                    {
+                        "lm_grad_norm": reg_running.get("lm_grad_norm", float("nan")),
+                        "clip_rate": reg_running["clip_hits"] / max(reg_running["clip_steps"], 1),
+                        "clip_rate_window": reg_running["window_hits"] / max(reg_running["window_steps"], 1),
+                    }
+                )
+                reg_running["window_hits"] = reg_running["window_steps"] = 0
             if regularizer is not None:
                 metrics.update(
                     {
@@ -598,28 +623,35 @@ def fit(
                         "reg_lambda": kres.replay_lambda,
                         "reg_used_layers": reg_running.get("used_layers", 0.0),
                         "reg_grad_norm": reg_running.get("reg_grad_norm", float("nan")),
-                        "lm_grad_norm": reg_running.get("lm_grad_norm", float("nan")),
                         "total_grad_norm": reg_running.get("total_grad_norm", float("nan")),
-                        "clip_rate": reg_running["clip_hits"] / max(reg_running["clip_steps"], 1),
                     }
                 )
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
+            # 字段顺序别动：02_smoke_pretrain.pbs 的汇总按这个顺序做正则。基线臂没有 R
+            # 和 |g_reg|，但 |g_lm| 与 clip 要用同样的格式打出来——正则臂那个触发率得减掉
+            # 基线才能归因到惩罚上。clip 打两个数：累计率 / 上一个 log 区间内的率。
+            if regularizer is not None:
+                extra = (
+                    f" | R: {metrics['reg_R']:.3e}"
+                    f" |g_lm|: {metrics['lm_grad_norm']:.3f}"
+                    f" |g_reg|: {metrics['reg_grad_norm']:.3e}"
+                    f" clip: {metrics['clip_rate']:.0%}/{metrics['clip_rate_window']:.0%}"
+                )
+            elif "clip_rate" in metrics:
+                extra = (
+                    f" | |g_lm|: {metrics['lm_grad_norm']:.3f}"
+                    f" clip: {metrics['clip_rate']:.0%}/{metrics['clip_rate_window']:.0%}"
+                )
+            else:
+                extra = ""
             fabric.print(
                 f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
-                f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
-                + (
-                    f" | R: {metrics['reg_R']:.3e}"
-                    f" |g_lm|: {metrics['lm_grad_norm']:.3f}"
-                    f" |g_reg|: {metrics['reg_grad_norm']:.3e}"
-                    f" clip: {metrics['clip_rate']:.0%}"
-                    if regularizer is not None
-                    else ""
-                )
+                f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}" + extra
             )
 
             throughput_metrics = throughput.compute()
