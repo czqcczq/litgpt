@@ -492,9 +492,15 @@ def fit(
         + "）"
     )
 
-    for train_data in train_iterator:
-        if state["iter_num"] >= max_iters:
-            break
+    # 原来是 `for train_data in train_iterator:` 再在循环体开头 `if iter_num >= max_iters: break`，
+    # 也就是**先取一个 batch 再判断要不要用它**。跑满 max_iters 之后还会多取一次，只为了
+    # 把它扔掉。上游那样写没问题：LitData 配 CycleIterator 是无限流，多取一个无所谓。
+    # 但本项目的 replay 混合 dataloader 名额是按「每段恰好一个 epoch」精确算出来的，
+    # 多要的那一个直接触发它的耗尽护栏——60 步全部跑完、checkpoint 也存了，然后在收尾
+    # 处抛 RuntimeError，成本汇总和消耗对账都打不出来。改成先判断后取。
+    # CycleIterator.__next__ 会惰性初始化内部迭代器，可以直接 next()。
+    while state["iter_num"] < max_iters:
+        train_data = next(train_iterator)
 
         # determine and set the learning rate for this iteration
         lr = get_lr(
