@@ -220,7 +220,9 @@ def main(
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
 
-    train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
+    train_dataloader, eval_dataloaders, final_eval_dataloaders = get_dataloaders(
+        fabric, data, tokenizer, train, model.max_seq_length
+    )
 
     # 混合 dataloader 的交错比例是 replay/(new+replay)，只有总量恰好等于 plan 算的
     # train_max_tokens 时，跑完全程消耗的 replay 才恰好是一个 epoch。填小了 replay 段
@@ -234,7 +236,15 @@ def main(
             f"replay 量」，直接填 8B 会让各臂的新域预算不相等。"
         )
 
-    train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
+    # setup_dataloaders 只接位置参数，所以先把名字抽出来、setup 完再按同样的顺序装回去。
+    # 传单个参数时它返回的是 loader 本身而不是列表，这里始终至少有 train + val 两个
+    _eval_names = list(eval_dataloaders) + list(final_eval_dataloaders)
+    _n_periodic = len(eval_dataloaders)
+    train_dataloader, *_eval_setup = fabric.setup_dataloaders(
+        train_dataloader, *eval_dataloaders.values(), *final_eval_dataloaders.values()
+    )
+    eval_dataloaders = dict(zip(_eval_names[:_n_periodic], _eval_setup[:_n_periodic]))
+    final_eval_dataloaders = dict(zip(_eval_names[_n_periodic:], _eval_setup[_n_periodic:]))
 
     if initial_checkpoint_dir:
         fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
@@ -276,7 +286,8 @@ def main(
         num_nodes=num_nodes,
         state=state,
         train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
+        eval_dataloaders=eval_dataloaders,
+        final_eval_dataloaders=final_eval_dataloaders,
         out_dir=out_dir,
         tokenizer_dir=tokenizer_dir,
         train=train,
@@ -408,7 +419,8 @@ def fit(
     devices: int,
     state: dict,
     train_dataloader: DataLoader,
-    val_dataloader: DataLoader,
+    eval_dataloaders: dict[str, DataLoader],
+    final_eval_dataloaders: dict[str, DataLoader],
     out_dir: Path,
     tokenizer_dir: Path | None,
     train: TrainArgs,
@@ -420,12 +432,31 @@ def fit(
     model = state["model"]
     optimizer = state["optimizer"]
 
+    # 训练日志那行 "val: x.xxx" 报的是哪个集合。第一个就是主验证集（新域 held-out）
+    primary_eval = next(iter(eval_dataloaders), None)
+
+    # 曲线的横轴。**跨臂比较不能用 step**：各臂 step 里掺的 replay 比例不同，同样是第
+    # 200 步，vanilla 已经吃了 419M 新域 token，replay 8B 只吃了约 210M，另一半是重放。
+    # 按 step 对齐等于拿「学了两倍新域」的点去比「忘得更少」。
+    # 取 _dataloader：_FabricDataLoader 只 update 了实例字典，属性是类上的，不转发
+    _train_inner = getattr(train_dataloader, "_dataloader", train_dataloader)
+
+    def x_axis() -> dict[str, float]:
+        consumed = getattr(_train_inner, "new_tokens_consumed", None)
+        return {} if consumed is None else {"new_tokens": float(consumed)}
+
     if eval.initial_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-        val_loss = f"{val_loss:.3f}"
+        # step 0 这次评的就是**基座本身**（权重刚从 initial_checkpoint_dir 载入、还没
+        # 更新过）。probe 上的这个数是遗忘量的基准，没有它，后面所有 probe loss 都只是
+        # 一个孤立的绝对值，说不出"掉了多少"。零成本，正式训练一定要开
+        losses = evaluate_all(fabric, model, eval_dataloaders, eval.max_iters)
+        fabric.print(f"Initial evaluation | {format_losses(losses)}")
+        fabric.log_dict({**loss_metrics(losses), **x_axis()}, step=state["iter_num"])
+        val_loss = f"{losses[primary_eval]:.3f}" if primary_eval else "n/a"
     else:
         fabric.print("Verifying settings ...")
-        validate(fabric, model, val_dataloader, max_iters=2, verbose=False)  # sanity check
+        for dl in eval_dataloaders.values():
+            validate(fabric, model, dl, max_iters=2, verbose=False)  # sanity check
         val_loss = "n/a"
 
     throughput = ThroughputMonitor(fabric, window_size=5)
@@ -606,6 +637,8 @@ def fit(
                 "tokens": state["iter_num"] * train.micro_batch_size * model.max_seq_length,
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
+                # total_tokens 把 replay 也算进去了，跨臂对齐要用新域那份，见 x_axis
+                **x_axis(),
             }
             if kres.log_grad_norms and train.max_norm:
                 metrics.update(
@@ -658,15 +691,17 @@ def fit(
             metrics.update(throughput_metrics)
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
 
-        if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
+        if eval_dataloaders and not is_accumulating and state["step_count"] % eval.interval == 0:
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-            val_loss = val_loss.item()
+            losses = evaluate_all(fabric, model, eval_dataloaders, eval.max_iters)
             td = time.perf_counter() - t0
+            val_loss = losses[primary_eval]
 
-            fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            fabric.print(
+                f"iter {state['iter_num']} step {state['step_count']}: "
+                f"{format_losses(losses)} | eval time: {td * 1000:.2f} ms"
+            )
+            fabric.log_dict({**loss_metrics(losses), **x_axis()}, step=state["iter_num"] - 1)
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
@@ -704,12 +739,42 @@ def fit(
     if summary is not None:
         fabric.print(summary())
 
-    # Final validation
+    # Final validation。这里才把 test 加进来：它全程不评，就是为了不参与选 λ
     if eval.final_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-        fabric.log_dict(metrics, step=state["iter_num"])
-        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+        losses = evaluate_all(fabric, model, {**eval_dataloaders, **final_eval_dataloaders}, eval.max_iters)
+        fabric.log_dict({**loss_metrics(losses), **x_axis()}, step=state["iter_num"])
+        fabric.print(f"Final evaluation | {format_losses(losses)}")
+
+
+def evaluate_all(
+    fabric: L.Fabric, model: nn.Module, loaders: dict[str, DataLoader], max_iters: int
+) -> dict[str, float]:
+    """在每个评估集上各跑一遍，返回 {名字: loss}。"""
+    return {
+        name: validate(fabric, model, dl, max_iters=max_iters, verbose=False).item()
+        for name, dl in loaders.items()
+    }
+
+
+def format_losses(losses: dict[str, float]) -> str:
+    """loss 与 ppl 并排打。
+
+    ppl = exp(loss) 是同一个数的单调变换，没有额外信息量，但论文报的是 ppl，直接打出来
+    省得事后换算、也省得换算时把底数记错。它等于**语料级**困惑度而不是「各 batch ppl 的
+    平均」，因为 `validate` 平均的是各 batch 的 loss，而预训练数据是打包过的、每个 batch
+    恰好 micro_batch × seq_len 个 token 且没有 ignore_index，无权平均正好等于 token 加权
+    平均。哪天评估集改成带 padding 的，这个等式就不成立了，得改成按 token 数加权。
+    """
+    return " | ".join(f"{name} loss {v:.4f} ppl {math.exp(v):.3f}" for name, v in losses.items())
+
+
+def loss_metrics(losses: dict[str, float]) -> dict[str, float]:
+    """展平成 logger 的列名：val_loss / val_ppl / probe_loss / probe_ppl / ..."""
+    metrics = {}
+    for name, v in losses.items():
+        metrics[f"{name}_loss"] = v
+        metrics[f"{name}_ppl"] = math.exp(v)
+    return metrics
 
 
 @torch.no_grad()
@@ -739,14 +804,31 @@ def validate(
 
 def get_dataloaders(
     fabric: L.Fabric, data: DataModule, tokenizer: Tokenizer, train: TrainArgs, block_size: int
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, dict[str, DataLoader], dict[str, DataLoader]]:
+    """返回 (训练流, 周期性评估集, 只在收尾评一次的集合)。
+
+    上游的 DataModule 只有 `val_dataloader()` 一个验证集，对它们两个 dict 退化成
+    `{"val": ...}` 和 `{}`，行为与改动前完全一致。`ReplayMixedData` 额外给出 probe
+    （旧域 held-out，遗忘量）和 test（新域 held-out，不参与调参）。
+    """
     data.connect(tokenizer=tokenizer, batch_size=train.micro_batch_size, max_seq_length=block_size)
     with fabric.rank_zero_first():
         data.prepare_data()
     data.setup()
     train_dataloader = data.train_dataloader()
-    val_dataloader = data.val_dataloader()
-    return train_dataloader, val_dataloader
+
+    if hasattr(data, "eval_dataloaders"):
+        eval_dataloaders = dict(data.eval_dataloaders())
+    else:
+        eval_dataloaders = {"val": data.val_dataloader()}
+    final_eval_dataloaders = dict(data.final_eval_dataloaders()) if hasattr(data, "final_eval_dataloaders") else {}
+
+    # 同名会让收尾那次的 log_dict 用同一个键写两遍，后写的静默覆盖先写的，
+    # 而两者评的是不同数据
+    overlap = sorted(set(eval_dataloaders) & set(final_eval_dataloaders))
+    if overlap:
+        raise SystemExit(f"评估集重名：{overlap} 同时出现在周期性评估和收尾评估里")
+    return train_dataloader, eval_dataloaders, final_eval_dataloaders
 
 
 def get_lr(
